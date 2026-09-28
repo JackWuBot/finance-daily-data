@@ -1,0 +1,30 @@
+name: 财经日知 · 每日采集
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: finance-daily-collect
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: 采集全球财经资讯与行情
+        run: node run.mjs
+      - name: 保存日报与历史归档
+        run: |
+          git config user.name 'Finance Daily Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update global finance daily digest'
+            git push
+          fi
