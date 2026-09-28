@@ -23,7 +23,7 @@ export function parseNews(xml,source,now=Date.now()){
   const companies=COMPANIES.filter(c=>new RegExp(c.id.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'|'+c.name,'i').test(cleanTitle)).map(c=>c.id);
   let category=source.category;
   if(['company','earnings'].includes(category)){category=isEarnings(cleanTitle)?'earnings':'company';if(source.category==='earnings'&&category!=='earnings')return [];}
-  else if(category==='market'&&/央行|美联储|利率|通胀|GDP|非农|货币|人民币|美元|日元|英镑|卢比|港元|降息|加息/.test(cleanTitle))category='macro';
+  else if(category==='market'&&/央行|美联储|利率|通胀|GDP|非农|货币政策|降息|加息|汇率|外汇|人民银行|流动性|英国预算/.test(cleanTitle))category='macro';
   const matched=COMPANIES.filter(c=>companies.includes(c.id));const region=matched.length&&['company','earnings'].includes(category)?matched[0].region:source.region;
   const raw=tag(b,'description')||tag(b,'summary')||tag(b,'content');
   return [{id:createHash('sha256').update(cleanTitle.toLowerCase().replace(/\s/g,'')).digest('hex').slice(0,20),title:cleanTitle,summary:isAggregate?'':raw.slice(0,450),url,publisherUrl,source:publisher,sourceId:source.id,official:source.official,via:isAggregate?'Google 新闻聚合':'直接来源',publishedAt:new Date(ts).toISOString(),collectedAt:new Date(now).toISOString(),category,region,companies}];
