@@ -149,6 +149,31 @@ export async function collectBonds(previous={},now=Date.now(),fetchBond=async(ur
  return {checkedAt,series:results.flatMap(r=>r.series),sources:results.map(r=>r.status)};
 }
 
+// Query separate 30-day windows so a busy final week cannot displace the whole quarter.
+export function quarterQueries(sources, now=Date.now()){
+ const end=Date.parse(new Date(now+8*3600000).toISOString().slice(0,10)+'T00:00:00Z')+86400000;
+ return sources.filter(s=>s.url.includes('news.google.com/rss/search')).flatMap(s=>Array.from({length:3},(_,i)=>{
+  const before=new Date(end-i*30*86400000).toISOString().slice(0,10),after=new Date(end-(i+1)*30*86400000).toISOString().slice(0,10);
+  const url=new URL(s.url);url.searchParams.set('q',url.searchParams.get('q').replace(/\s+when:\S+/g,'')+` after:${after} before:${before}`);
+  return {...s,id:`quarter-${s.id}-${i}`,url:url.href,after,before,name:s.name+' · '+after+'—'+before};
+ }));
+}
+export async function collectQuarterNews({sources,request,parseNews,pool,previous={},now=Date.now()}){
+ const jobs=quarterQueries(sources,now),stamp=new Date(now).toISOString();
+ const results=await pool(jobs,async s=>{
+  try{
+   const rows=parseNews(await request(s.url),s,now).filter(n=>n.publishedAt.slice(0,10)>=s.after&&n.publishedAt.slice(0,10)<s.before&&Date.parse(n.publishedAt)<=now).sort((a,b)=>a.publishedAt.localeCompare(b.publishedAt));
+   // Evenly sample each window; retain both early and late observations.
+   const items=rows.length<=18?rows:Array.from({length:18},(_,i)=>rows[Math.round(i*(rows.length-1)/17)]);
+   return {items,status:{id:s.id,name:s.name,url:s.url,ok:true,count:items.length,checkedAt:stamp,error:null}};
+  }catch(e){return {items:[],status:{id:s.id,name:s.name,url:s.url,ok:false,count:0,checkedAt:stamp,error:String(e.message).slice(0,160)}};}
+ },5);
+ const failed=new Set(results.filter(r=>!r.status.ok).map(r=>r.status.id));
+ const rows=[...results.flatMap(r=>r.items),...(previous.quarterNews||[]).filter(n=>failed.has(n.sourceId))];
+ const quarterNews=[...new Map(rows.filter(n=>Date.parse(n.publishedAt)>=now-90*86400000&&Date.parse(n.publishedAt)<=now).map(n=>[n.id,n])).values()].sort((a,b)=>b.publishedAt.localeCompare(a.publishedAt)).slice(0,2500);
+ return {quarterNews,quarterSources:results.map(r=>r.status),quarterCheckedAt:stamp};
+}
+
 const DAY=86400000;
 const TRUSTED_DOMAINS=['reuters.com','bloomberg.com','ft.com','ftchinese.com','wsj.com','cnbc.com','sina.com.cn','sina.cn','eastmoney.com','cls.cn','stcn.com','cnstock.com','yicai.com','21jingji.com','thepaper.cn','jiemian.com','stheadline.com','hk01.com','hket.com','aastocks.com','yahoo.com','investing.com','caixin.com','xinhua.com','news.cn','chinanews.com.cn','chinanews.com','cnr.cn','gov.cn','cctv.com','people.com.cn','chinadaily.com.cn','stnn.cc','dw.com','bbc.com','rfi.fr','rthk.hk','coindesk.com','cointelegraph.com','theblock.co','decrypt.co','zaobao.com.sg','zaobao.com','fxstreet.com','wallstreetcn.com','36kr.com','nbd.com.cn','mrjjxw.com','stockstar.com','10jqka.com.cn','hexun.com','financialnews.com.cn','hkej.com','etnet.com.hk','businesstimes.com.sg','scmp.com','nikkei.com','moneydj.com','cnyes.com','udn.com','reutersconnect.com','pbc.gov.cn','rbi.org.in','hkma.gov.hk','ecb.europa.eu','federalreserve.gov'];
 export function trustedPublisher(url){try{const host=new URL(url).hostname.toLowerCase();return TRUSTED_DOMAINS.some(d=>host===d||host.endsWith('.'+d))}catch{return false}}
@@ -227,6 +252,7 @@ export async function collect(previous={},now=Date.now()){
  const stamp=new Date(now).toISOString();
  const calendarPromise=collectCalendar(previous,now);
  const bondsPromise=collectBonds(previous.bonds,now);
+ const quarterPromise=collectQuarterNews({sources:SOURCES,request,parseNews,pool,previous,now});
  const stocksPromise=pool(COMPANY_ASSETS,async a=>{try{return await collectMarket(a,now)}catch(e){const old=previous.companyMarkets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)}}},4);
  const newsResults=await pool(SOURCES,async s=>{try{const items=await collectSource(s,now);return {items,status:{id:s.id,name:s.name,url:s.home,ok:true,count:items.length,checkedAt:stamp,error:null}};}catch(e){return {items:[],status:{id:s.id,name:s.name,url:s.home,ok:false,count:0,checkedAt:stamp,error:String(e.message).slice(0,160)}};}});
  const markets=await pool(ASSETS,async a=>{try{return await collectMarket(a,now);}catch(e){const old=previous.markets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)};}});
@@ -239,7 +265,7 @@ export async function collect(previous={},now=Date.now()){
  const date=beijingDate(now),today=news.filter(n=>Date.parse(n.publishedAt)>=now-DAY);
  const selected=[];const counts=new Map();for(const c of ['macro','market','earnings','company','gold','crypto']){const candidates=today.filter(n=>n.category===c);for(const n of candidates){if((counts.get(n.source)||0)>=2)continue;selected.push(n.id);counts.set(n.source,(counts.get(n.source)||0)+1);if(selected.filter(id=>news.find(x=>x.id===id)?.category===c).length>=2)break;}}
  const edition={date,generatedAt:stamp,newsCount:today.length,headlineIds:selected,coverage:newsResults.filter(r=>r.status.ok).length,totalSources:newsResults.length,markets:markets.map(({points,...m})=>m)};
- return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,companyMarkets,bonds,fxReference,sources,...await calendarPromise,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
+ return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,companyMarkets,bonds,fxReference,sources,...await calendarPromise,...await quarterPromise,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
 }
 
 
