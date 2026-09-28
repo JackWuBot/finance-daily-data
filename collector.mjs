@@ -48,6 +48,16 @@ export function parseChart(raw,asset,now=Date.now()){
 export function parseECB(xml){
  return [...xml.matchAll(/<Cube time=['"]([^'"]+)['"]>([\s\S]*?)<\/Cube>/g)].map(m=>({date:m[1],rates:Object.fromEntries([...m[2].matchAll(/<Cube currency=['"]([^'"]+)['"] rate=['"]([^'"]+)['"]/g)].map(r=>[r[1],Number(r[2])]))})).sort((a,b)=>a.date.localeCompare(b.date));
 }
+export async function collectMarket(a,now=Date.now()){
+ if(a.id==='csi300'){
+  const raw=await request('https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.000300&klt=101&fqt=0&lmt=270&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61','json');
+  const points=(raw.data?.klines||[]).map(line=>{const fields=line.split(',');return {date:fields[0],value:Number(fields[2])}}).filter(p=>p.date<=beijingDate(now)&&Number.isFinite(p.value)&&p.value>0);
+  if(points.length<2)throw new Error('沪深300历史日线不足');
+  const latest=points.at(-1),prior=points.at(-2);
+  return {...a,points,price:latest.value,changePct:(latest.value/prior.value-1)*100,asOf:latest.date,timezone:'Asia/Shanghai',currency:'CNY',source:'东方财富 · 指数日线',sourceUrl:'https://quote.eastmoney.com/zs000300.html',fetchedAt:new Date(now).toISOString(),ok:true,error:null,note:'指数日线可能包含当日未收盘数据；涨跌对比上一条有效日线。'};
+ }
+ return parseChart(await request('https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(a.symbol)+'?range=1y&interval=1d','json'),a,now);
+}
 export async function collectSource(s,now=Date.now()){
  if(s.kind!=='hkma')return parseNews(await request(s.url),s,now);
  const raw=await request(s.url,'json');if(!raw.header?.success||!Array.isArray(raw.result?.records))throw new Error('金管局 API 格式异常');
@@ -60,7 +70,7 @@ export async function collectSource(s,now=Date.now()){
 export async function collect(previous={},now=Date.now()){
  const stamp=new Date(now).toISOString();
  const newsResults=await pool(SOURCES,async s=>{try{const items=await collectSource(s,now);return {items,status:{id:s.id,name:s.name,url:s.home,ok:true,count:items.length,checkedAt:stamp,error:null}};}catch(e){return {items:[],status:{id:s.id,name:s.name,url:s.home,ok:false,count:0,checkedAt:stamp,error:String(e.message).slice(0,160)}};}});
- const markets=await pool(ASSETS,async a=>{try{return parseChart(await request('https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(a.symbol)+'?range=1y&interval=1d','json'),a,now);}catch(e){const old=previous.markets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)};}});
+ const markets=await pool(ASSETS,async a=>{try{return await collectMarket(a,now);}catch(e){const old=previous.markets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)};}});
  let fxReference=previous.fxReference||null;let fxStatus;
  try{const points=parseECB(await request('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml'));if(!points.length)throw new Error('无有效参考汇率');fxReference={base:'EUR',source:'欧洲央行',url:'https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html',fetchedAt:stamp,points};fxStatus={id:'ecb-fx',name:'欧洲央行 · 参考汇率',url:fxReference.url,ok:true,count:points.length,checkedAt:stamp};}catch(e){fxStatus={id:'ecb-fx',name:'欧洲央行 · 参考汇率',url:'https://www.ecb.europa.eu/',ok:false,count:0,error:e.message,checkedAt:stamp};}
  const news=mergeNews([...newsResults.flatMap(r=>r.items),...(previous.news||[])],now);
