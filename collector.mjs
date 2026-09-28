@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {ASSETS,COMPANIES,SOURCES} from './catalog.mjs';
+import {ASSETS,COMPANIES,COMPANY_ASSETS,SOURCES} from './catalog.mjs';
 const CAL_DAY=86400000;
 const calPlain=s=>String(s||'').replace(/<[^>]+>/g,' ').replace(/&nbsp;|&#160;/g,' ').replace(/&amp;/g,'&').replace(/\s+/g,' ').trim();
 const calMonth=s=>['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(s.toLowerCase().slice(0,3))+1;
@@ -91,6 +91,64 @@ export async function collectCalendar(previous={},now=Date.now(),fetchText=async
  return {events,calendarSources:result.map(r=>r.status),calendarCheckedAt:checkedAt};
 }
 
+const BDAY=86400000;
+export const BOND_GROUPS={US:'美国国债',CN:'中国国债',LGFV:'城投债'};
+export const CHINA_CURVES=[
+ {key:'cn',group:'CN',name:'中债国债收益率曲线',curveId:'2c9081e50a2f9606010a3068cae70001',tenors:[1,2,3,5,10,30]},
+ {key:'lgfv-aaa',group:'LGFV',name:'中债城投债收益率曲线(AAA)',rating:'AAA',curveId:'2c9081e91b55cc84011be3c53b710598',tenors:[1,3,5]},
+ {key:'lgfv-aap',group:'LGFV',name:'中债城投债收益率曲线(AA＋)',rating:'AA+',curveId:'2c9081e91b55cc84011bd98af3dc1533',tenors:[1,3,5]},
+ {key:'lgfv-aa',group:'LGFV',name:'中债城投债收益率曲线(AA)',rating:'AA',curveId:'2c9081e91b55cc84011c07e9991e15c9',tenors:[1,3,5]}
+];
+const US_TENORS=[[.25,'BC_3MONTH'],[1,'BC_1YEAR'],[2,'BC_2YEAR'],[5,'BC_5YEAR'],[10,'BC_10YEAR'],[30,'BC_30YEAR']];
+const BOND_HOME='https://yield.chinabond.com.cn/cbweb-mn/yield_main?locale=zh_CN';
+const US_HOME='https://home.treasury.gov/resource-center/data-chart-center/interest-rates/TextView?type=daily_treasury_yield_curve';
+const bondDate=(now,tz)=>new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
+export function cleanYieldPoints(points,now=Date.now(),timezone='Asia/Shanghai'){
+ const end=bondDate(now,timezone),start=bondDate(now-400*BDAY,timezone);
+ return [...new Map(points.filter(p=>/^\d{4}-\d{2}-\d{2}$/.test(p.date)&&p.date>=start&&p.date<=end&&typeof p.value==='number'&&Number.isFinite(p.value)&&p.value>=-20&&p.value<=100).map(p=>[p.date,p])).values()].sort((a,b)=>a.date.localeCompare(b.date)).slice(-400);
+}
+function yieldSeries(meta,points,now){
+ points=cleanYieldPoints(points,now,meta.timezone);const last=points.at(-1),prior=points.at(-2);
+ if(!last)throw new Error('无有效收益率日线');
+ return {...meta,kind:'yield',unit:'%',symbol:meta.id,points,price:last.value,asOf:last.date,changePct:null,changeBp:prior?(last.value-prior.value)*100:null,ok:true,error:null,fetchedAt:new Date(now).toISOString()};
+}
+export function parseTreasury(xml,now=Date.now()){
+ const entries=xml.match(/<entry>[\s\S]*?<\/entry>/g)||[];
+ return US_TENORS.map(([tenor,field])=>{
+  const points=entries.flatMap(e=>{const date=e.match(/<d:NEW_DATE\b[^>]*>([^<]+)/)?.[1]?.slice(0,10),raw=e.match(new RegExp('<d:'+field+'\\b[^>]*>([^<]+)'))?.[1];return date&&raw?.trim()&&Number.isFinite(Number(raw))?[{date,value:Number(raw)}]:[];});
+  return yieldSeries({id:'us-'+tenor,group:'US',region:'US',tenor,name:'美国国债 · '+(tenor===.25?'3 个月':tenor+' 年'),timezone:'America/New_York',source:'美国财政部 · 名义平价收益率',sourceUrl:US_HOME,note:'财政部每日名义平价收益率曲线（CMT）；为估计收益率，不是某只债券的成交价格。'},points,now);
+ });
+}
+export function parseChinaYields(raw,curve,now=Date.now()){
+ if(!Array.isArray(raw))throw new Error('中债曲线格式异常');
+ return curve.tenors.map(tenor=>{
+  const item=raw.find(r=>r.ycDefId===curve.curveId+Number(tenor).toFixed(1)&&r.ycDefName===curve.name+'(到期)('+tenor+'y)');
+  if(!item||!Array.isArray(item.seriesData))throw new Error('曲线名称或期限不匹配：'+curve.name+' '+tenor+'年');
+  const points=item.seriesData.flatMap(p=>Array.isArray(p)&&typeof p[0]==='number'&&Number.isFinite(p[0])?[{date:bondDate(p[0],'Asia/Shanghai'),value:p[1]}]:[]);
+  return yieldSeries({id:curve.key+'-'+tenor,group:curve.group,rating:curve.rating,region:'CN',tenor,name:(curve.group==='CN'?'中国国债':'城投债 '+curve.rating)+' · '+tenor+' 年',timezone:'Asia/Shanghai',source:curve.name+' · 到期收益率',sourceUrl:BOND_HOME,note:'中债估值曲线的标准期限到期收益率；不是单券成交收益率。'+(curve.group==='LGFV'?'评级口径来自该曲线，不能替代具体发行人的信用评估。':'')},points,now);
+ });
+}
+export function spreadSeries(a,b){
+ const other=new Map((b?.points||[]).map(p=>[p.date,p.value]));
+ return (a?.points||[]).flatMap(p=>other.has(p.date)?[{date:p.date,value:(p.value-other.get(p.date))*100}]:[]);
+}
+export function curveSnapshot(series){
+ const usable=series.filter(s=>s.points?.length);if(!usable.length)return {date:null,rows:[],partial:series.length>0};
+ const dates=usable[0].points.map(p=>p.date).filter(d=>usable.every(s=>s.points.some(p=>p.date===d))).sort();const date=dates.at(-1);
+ if(!date)return {date:null,rows:[],partial:true};
+ const rows=[...new Set(usable.map(s=>s.tenor))].sort((a,b)=>a-b).map(tenor=>({tenor,...Object.fromEntries(usable.filter(s=>s.tenor===tenor).map(s=>[s.rating||'yield',s.points.find(p=>p.date===date).value]))}));
+ return {date,rows,partial:usable.length!==series.length||usable.some(s=>!s.ok)};
+}
+export async function collectBonds(previous={},now=Date.now(),fetchBond=async(url,method='GET')=>{const r=await fetch(url,{method,signal:AbortSignal.timeout(25000)});if(!r.ok)throw new Error('HTTP '+r.status);return r.text()}){
+ const checkedAt=new Date(now).toISOString(),year=new Date(now).getUTCFullYear();
+ const jobs=[{id:'bonds-us',name:'美国财政部 · 国债收益率',url:US_HOME,group:'US',run:async()=>parseTreasury((await Promise.all([year-1,year].map(y=>fetchBond('https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value='+y)))).join('\n'),now)},...CHINA_CURVES.map(curve=>({id:'bonds-'+curve.key,name:curve.name,url:BOND_HOME,group:curve.group,rating:curve.rating,run:async()=>{
+  const params=new URLSearchParams({bjlx:'no',dcq:curve.tenors.map(t=>t+','+t+'y;').join(''),startTime:bondDate(now-370*BDAY,'Asia/Shanghai'),endTime:bondDate(now,'Asia/Shanghai'),qxlx:'0,',yqqxN:'N',yqqxK:'K',par:'day',ycDefIds:curve.curveId,locale:'zh_CN'});
+  return parseChinaYields(JSON.parse(await fetchBond('https://yield.chinabond.com.cn/cbweb-mn/yc/queryYz?'+params,'POST')),curve,now);
+ }}))];
+ const results=await Promise.all(jobs.map(async j=>{try{const series=await j.run();return {series,status:{id:j.id,name:j.name,url:j.url,ok:true,count:series.length,checkedAt,error:null}}}catch(e){const error=String(e.message).slice(0,160);return {series:(previous.series||[]).filter(s=>s.group===j.group&&(j.group!=='LGFV'||s.rating===j.rating)).map(s=>({...s,ok:false,error})),status:{id:j.id,name:j.name,url:j.url,ok:false,count:0,checkedAt,error}}}}));
+ return {checkedAt,series:results.flatMap(r=>r.series),sources:results.map(r=>r.status)};
+}
+
 const DAY=86400000;
 const TRUSTED_DOMAINS=['reuters.com','bloomberg.com','ft.com','ftchinese.com','wsj.com','cnbc.com','sina.com.cn','sina.cn','eastmoney.com','cls.cn','stcn.com','cnstock.com','yicai.com','21jingji.com','thepaper.cn','jiemian.com','stheadline.com','hk01.com','hket.com','aastocks.com','yahoo.com','investing.com','caixin.com','xinhua.com','news.cn','chinanews.com.cn','chinanews.com','cnr.cn','gov.cn','cctv.com','people.com.cn','chinadaily.com.cn','stnn.cc','dw.com','bbc.com','rfi.fr','rthk.hk','coindesk.com','cointelegraph.com','theblock.co','decrypt.co','zaobao.com.sg','zaobao.com','fxstreet.com','wallstreetcn.com','36kr.com','nbd.com.cn','mrjjxw.com','stockstar.com','10jqka.com.cn','hexun.com','financialnews.com.cn','hkej.com','etnet.com.hk','businesstimes.com.sg','scmp.com','nikkei.com','moneydj.com','cnyes.com','udn.com','reutersconnect.com','pbc.gov.cn','rbi.org.in','hkma.gov.hk','ecb.europa.eu','federalreserve.gov'];
 export function trustedPublisher(url){try{const host=new URL(url).hostname.toLowerCase();return TRUSTED_DOMAINS.some(d=>host===d||host.endsWith('.'+d))}catch{return false}}
@@ -133,12 +191,15 @@ export function parseChart(raw,asset,now=Date.now()){
  const r=raw.chart?.result?.[0];if(!r)throw new Error(raw.chart?.error?.description||'无行情');
  const tz=r.meta?.exchangeTimezoneName||'UTC';
  const date=t=>new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(t*1000));
- const close=r.indicators?.quote?.[0]?.close||[];
- const points=(r.timestamp||[]).flatMap((t,i)=>Number.isFinite(close[i])&&close[i]>0?[{date:date(t),value:close[i]}]:[]);
+ const rawClose=r.indicators?.quote?.[0]?.close||[],adjusted=r.indicators?.adjclose?.[0]?.adjclose||[];
+ const adjustedBasis=asset.kind==='equity'&&adjusted.filter(v=>Number.isFinite(v)&&v>0).length>=2;
+ const close=adjustedBasis?adjusted:rawClose;
+ const points=(r.timestamp||[]).flatMap((t,i)=>Number.isFinite(t)&&t*1000<=now&&Number.isFinite(close[i])&&close[i]>0?[{date:date(t),value:close[i]}]:[]);
  const unique=[...new Map(points.map(p=>[p.date,p])).values()].sort((a,b)=>a.date.localeCompare(b.date));
  if(!unique.length)throw new Error('无有效日线');
  const latest=unique.at(-1),prior=unique.at(-2);
- return {...asset,points:unique,price:latest.value,changePct:prior?(latest.value/prior.value-1)*100:null,asOf:latest.date,quoteTime:r.meta.regularMarketTime?new Date(r.meta.regularMarketTime*1000).toISOString():null,timezone:tz,currency:r.meta.currency,source:'Yahoo Finance · 日线',sourceUrl:'https://finance.yahoo.com/quote/'+encodeURIComponent(asset.symbol)+'/',fetchedAt:new Date(now).toISOString(),ok:true,error:null,note:asset.id==='gold'||asset.id==='oil'?'连续近月期货，换月可能影响走势；非现货报价。':'日线可能包含当日未收盘数据；涨跌对比上一条有效日线。'};
+ const currency=r.meta.currency,unit=asset.kind==='equity'?({USD:'美元/股',CNY:'人民币/股',HKD:'港元/股',JPY:'日元/股',EUR:'欧元/股',INR:'卢比/股',GBP:'英镑/股',GBp:'便士/股 (GBp)'}[currency]||currency+'/股'):asset.unit;
+ return {...asset,unit,points:unique,price:latest.value,changePct:prior?(latest.value/prior.value-1)*100:null,asOf:latest.date,quoteTime:r.meta.regularMarketTime?new Date(r.meta.regularMarketTime*1000).toISOString():null,timezone:tz,currency,priceBasis:asset.kind==='equity'?(adjustedBasis?'adjusted':'close'):undefined,source:'Yahoo Finance · 日线',sourceUrl:'https://finance.yahoo.com/quote/'+encodeURIComponent(asset.symbol)+'/',fetchedAt:new Date(now).toISOString(),ok:true,error:null,note:asset.kind==='equity'?(adjustedBasis?'采用供应商调整后收盘价（拆股、分红调整），历史数据可能随公司行动修订。':'调整后数据不可用，整条曲线采用供应商收盘价，未另行作分红复权。')+(currency==='GBp'?'以便士计价，100 便士 = 1 英镑。':'')+'各市场交易日与收盘时间不同，日线可能包含当日未收盘数据；区间变化不等于已实现收益。':asset.id==='gold'||asset.id==='oil'?'连续近月期货，换月可能影响走势；非现货报价。':'日线可能包含当日未收盘数据；涨跌对比上一条有效日线。'};
 }
 export function parseECB(xml){
  return [...xml.matchAll(/<Cube time=['"]([^'"]+)['"]>([\s\S]*?)<\/Cube>/g)].map(m=>({date:m[1],rates:Object.fromEntries([...m[2].matchAll(/<Cube currency=['"]([^'"]+)['"] rate=['"]([^'"]+)['"]/g)].map(r=>[r[1],Number(r[2])]))})).sort((a,b)=>a.date.localeCompare(b.date));
@@ -165,17 +226,20 @@ export async function collectSource(s,now=Date.now()){
 export async function collect(previous={},now=Date.now()){
  const stamp=new Date(now).toISOString();
  const calendarPromise=collectCalendar(previous,now);
+ const bondsPromise=collectBonds(previous.bonds,now);
+ const stocksPromise=pool(COMPANY_ASSETS,async a=>{try{return await collectMarket(a,now)}catch(e){const old=previous.companyMarkets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)}}},4);
  const newsResults=await pool(SOURCES,async s=>{try{const items=await collectSource(s,now);return {items,status:{id:s.id,name:s.name,url:s.home,ok:true,count:items.length,checkedAt:stamp,error:null}};}catch(e){return {items:[],status:{id:s.id,name:s.name,url:s.home,ok:false,count:0,checkedAt:stamp,error:String(e.message).slice(0,160)}};}});
  const markets=await pool(ASSETS,async a=>{try{return await collectMarket(a,now);}catch(e){const old=previous.markets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)};}});
  let fxReference=previous.fxReference||null;let fxStatus;
  try{const points=parseECB(await request('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml'));if(!points.length)throw new Error('无有效参考汇率');fxReference={base:'EUR',source:'欧洲央行',url:'https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html',fetchedAt:stamp,points};fxStatus={id:'ecb-fx',name:'欧洲央行 · 参考汇率',url:fxReference.url,ok:true,count:points.length,checkedAt:stamp};}catch(e){fxStatus={id:'ecb-fx',name:'欧洲央行 · 参考汇率',url:'https://www.ecb.europa.eu/',ok:false,count:0,error:e.message,checkedAt:stamp};}
  const news=mergeNews([...newsResults.flatMap(r=>r.items),...(previous.news||[])],now);
  if(!newsResults.some(r=>r.status.ok&&r.items.length)&&!markets.some(m=>m.ok))throw new Error('本次全部来源失败，保留上一版日报');
- const sources=[...newsResults.map(r=>r.status),fxStatus];
+ const companyMarkets=await stocksPromise,bonds=await bondsPromise;
+ const sources=[...newsResults.map(r=>r.status),fxStatus,...bonds.sources,{id:'company-prices',name:'主要公司 · 股票日线',url:'https://finance.yahoo.com/',ok:companyMarkets.every(m=>m.ok),count:companyMarkets.filter(m=>m.ok).length,checkedAt:stamp,error:companyMarkets.every(m=>m.ok)?null:companyMarkets.filter(m=>!m.ok).map(m=>m.name).join('、')+'未更新'}];
  const date=beijingDate(now),today=news.filter(n=>Date.parse(n.publishedAt)>=now-DAY);
  const selected=[];const counts=new Map();for(const c of ['macro','market','earnings','company','gold','crypto']){const candidates=today.filter(n=>n.category===c);for(const n of candidates){if((counts.get(n.source)||0)>=2)continue;selected.push(n.id);counts.set(n.source,(counts.get(n.source)||0)+1);if(selected.filter(id=>news.find(x=>x.id===id)?.category===c).length>=2)break;}}
  const edition={date,generatedAt:stamp,newsCount:today.length,headlineIds:selected,coverage:newsResults.filter(r=>r.status.ok).length,totalSources:newsResults.length,markets:markets.map(({points,...m})=>m)};
- return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,fxReference,sources,...await calendarPromise,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
+ return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,companyMarkets,bonds,fxReference,sources,...await calendarPromise,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
 }
 
 
