@@ -1,6 +1,8 @@
 import {createHash} from 'node:crypto';
 import {ASSETS,COMPANIES,SOURCES} from './catalog.mjs';
 const DAY=86400000;
+const TRUSTED_DOMAINS=['reuters.com','bloomberg.com','ft.com','ftchinese.com','wsj.com','cnbc.com','sina.com.cn','sina.cn','eastmoney.com','cls.cn','stcn.com','cnstock.com','yicai.com','21jingji.com','thepaper.cn','jiemian.com','stheadline.com','hk01.com','hket.com','aastocks.com','yahoo.com','investing.com','caixin.com','xinhua.com','news.cn','chinanews.com.cn','chinanews.com','cnr.cn','gov.cn','cctv.com','people.com.cn','chinadaily.com.cn','stnn.cc','dw.com','bbc.com','rfi.fr','rthk.hk','coindesk.com','cointelegraph.com','theblock.co','decrypt.co','zaobao.com.sg','zaobao.com','fxstreet.com','wallstreetcn.com','36kr.com','nbd.com.cn','mrjjxw.com','stockstar.com','10jqka.com.cn','hexun.com','financialnews.com.cn','hkej.com','etnet.com.hk','businesstimes.com.sg','scmp.com','nikkei.com','moneydj.com','cnyes.com','udn.com','reutersconnect.com','pbc.gov.cn','rbi.org.in','hkma.gov.hk','ecb.europa.eu','federalreserve.gov'];
+export function trustedPublisher(url){try{const host=new URL(url).hostname.toLowerCase();return TRUSTED_DOMAINS.some(d=>host===d||host.endsWith('.'+d))}catch{return false}}
 export const beijingDate=(time=Date.now())=>new Date(new Date(time).getTime()+8*3600000).toISOString().slice(0,10);
 export function plain(s=''){return String(s).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g,'$1').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'').replace(/<[^>]+>/g,' ').replace(/&#(\d+);/g,(_,n)=>Number(n)<=0x10ffff?String.fromCodePoint(Number(n)):'').replace(/&(amp|lt|gt|quot|apos|nbsp);/g,(_,n)=>({amp:'&',lt:'<',gt:'>',quot:'"',apos:"'",nbsp:' '})[n]).replace(/\s+/g,' ').trim();}
 const tag=(s,k)=>plain(s.match(new RegExp('<'+k+'(?:\\s[^>]*)?>([\\s\\S]*?)<\\/'+k+'>','i'))?.[1]||'');
@@ -14,19 +16,21 @@ export function parseNews(xml,source,now=Date.now()){
   const url=safeUrl(tag(b,'link')||b.match(/<link\b[^>]*href=["']([^"']+)["']/i)?.[1]||'',source.home);
   if(!title||!url||!Number.isFinite(ts)||ts>now+3600000||ts<now-90*DAY)return [];
   const publisher=tag(b,'source')||source.name;
-  const cleanTitle=title.endsWith(' - '+publisher)?title.slice(0,-publisher.length-3):title;
+  const isAggregate=source.url.includes('news.google.com');
+  const publisherUrl=safeUrl(b.match(/<source\b[^>]*url=["']([^"']+)["']/i)?.[1]||'');
+  if(isAggregate&&!trustedPublisher(publisherUrl))return [];
+  const cleanTitle=(title.endsWith(' - '+publisher)?title.slice(0,-publisher.length-3):title).split('|')[0].trim();
   const companies=COMPANIES.filter(c=>new RegExp(c.id.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'|'+c.name,'i').test(cleanTitle)).map(c=>c.id);
   let category=source.category;
   if(['company','earnings'].includes(category)){category=isEarnings(cleanTitle)?'earnings':'company';if(source.category==='earnings'&&category!=='earnings')return [];}
   else if(category==='market'&&/央行|美联储|利率|通胀|GDP|非农|货币|人民币|美元|日元|英镑|卢比|港元|降息|加息/.test(cleanTitle))category='macro';
   const matched=COMPANIES.filter(c=>companies.includes(c.id));const region=matched.length&&['company','earnings'].includes(category)?matched[0].region:source.region;
   const raw=tag(b,'description')||tag(b,'summary')||tag(b,'content');
-  const isAggregate=source.url.includes('news.google.com');
-  return [{id:createHash('sha256').update(cleanTitle.toLowerCase().replace(/\s/g,'')).digest('hex').slice(0,20),title:cleanTitle,summary:isAggregate?'':raw.slice(0,450),url,source:publisher,sourceId:source.id,official:source.official,via:isAggregate?'Google 新闻聚合':'直接来源',publishedAt:new Date(ts).toISOString(),collectedAt:new Date(now).toISOString(),category,region,companies}];
+  return [{id:createHash('sha256').update(cleanTitle.toLowerCase().replace(/\s/g,'')).digest('hex').slice(0,20),title:cleanTitle,summary:isAggregate?'':raw.slice(0,450),url,publisherUrl,source:publisher,sourceId:source.id,official:source.official,via:isAggregate?'Google 新闻聚合':'直接来源',publishedAt:new Date(ts).toISOString(),collectedAt:new Date(now).toISOString(),category,region,companies}];
  });
 }
 export function mergeNews(items,now=Date.now()){
- const map=new Map();for(const a of items){if(!Number.isFinite(Date.parse(a.publishedAt))||Date.parse(a.publishedAt)<now-90*DAY)continue;const old=map.get(a.id);if(!old||a.official&&!old.official)map.set(a.id,a);}
+ const map=new Map();for(const a of items){if(a.via==='Google 新闻聚合'&&!trustedPublisher(a.publisherUrl))continue;if(!Number.isFinite(Date.parse(a.publishedAt))||Date.parse(a.publishedAt)<now-90*DAY)continue;const old=map.get(a.id);if(!old||a.official&&!old.official)map.set(a.id,a);}
  return [...map.values()].sort((a,b)=>b.publishedAt.localeCompare(a.publishedAt)).slice(0,1600);
 }
 export async function request(url,type='text'){
@@ -81,3 +85,4 @@ export async function collect(previous={},now=Date.now()){
  const edition={date,generatedAt:stamp,newsCount:today.length,headlineIds:selected,coverage:newsResults.filter(r=>r.status.ok).length,totalSources:newsResults.length,markets:markets.map(({points,...m})=>m)};
  return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,fxReference,sources,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
 }
+
