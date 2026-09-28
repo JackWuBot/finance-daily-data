@@ -1,5 +1,96 @@
 import {createHash} from 'node:crypto';
 import {ASSETS,COMPANIES,SOURCES} from './catalog.mjs';
+const CAL_DAY=86400000;
+const calPlain=s=>String(s||'').replace(/<[^>]+>/g,' ').replace(/&nbsp;|&#160;/g,' ').replace(/&amp;/g,'&').replace(/\s+/g,' ').trim();
+const calMonth=s=>['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(s.toLowerCase().slice(0,3))+1;
+const calDate=(y,m,d)=>`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+const calCells=row=>[...row.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map(m=>calPlain(m[1]));
+const allAssets=['sp500','nasdaq','euro50','nikkei','csi300','shanghai','ftse','nifty','hsi','gold','btc','oil','eurusd','usdjpy','usdcny','gbpusd','usdinr','usdhkd'];
+export const CALENDAR_SOURCES=[
+ {id:'cal-fed',name:'美联储 · FOMC 日程',url:'https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm',parser:'fed',region:'US',timezone:'America/New_York',assets:allAssets},
+ {id:'cal-ecb',name:'欧洲央行 · 议息日程',url:'https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html',parser:'ecb',region:'EU',timezone:'Europe/Berlin',assets:['euro50','eurusd','gold']},
+ {id:'cal-boj',name:'日本央行 · 议息日程',url:'https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm',parser:'boj',region:'JP',timezone:'Asia/Tokyo',assets:['nikkei','usdjpy','gold']},
+ {id:'cal-boe',name:'英国央行 · 议息日程',url:'https://www.bankofengland.co.uk/monetary-policy/upcoming-mpc-dates',parser:'boe',region:'UK',timezone:'Europe/London',assets:['ftse','gbpusd']},
+ {id:'cal-bls',name:'美国劳工统计局 · 数据日历',url:'https://www.bls.gov/schedule/news_release/bls.ics',parser:'ics',region:'US',timezone:'America/New_York',assets:allAssets},
+ {id:'cal-bea',name:'美国经济分析局 · GDP / PCE 日历',url:'https://www.bea.gov/news/schedule/ics/online-calendar-subscription.ics',parser:'ics',region:'US',timezone:'America/New_York',assets:allAssets},
+ {id:'cal-nbs',name:'国家统计局 · 发布日程',url:'https://www.stats.gov.cn/xxgk/sjfb/fbrcb/',parser:'nbs',region:'CN',timezone:'Asia/Shanghai',assets:['csi300','shanghai','hsi','usdcny','oil']}
+];
+export function zonedTimeToISO(date,time,zone){
+ const [y,m,d]=date.split('-').map(Number),[h,min]=time.split(':').map(Number);const wall=Date.UTC(y,m-1,d,h,min);let guess=wall;
+ for(let i=0;i<3;i++){const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(guess).map(x=>[x.type,x.value]));const seen=Date.UTC(+p.year,+p.month-1,+p.day,+p.hour,+p.minute,+p.second);guess+=wall-seen;}
+ return new Date(guess).toISOString();
+}
+function calEvent(s,date,title,extra={}){return {id:`${s.id}-${date}-${title}`,sourceId:s.id,source:s.name,sourceUrl:s.url,region:s.region,timezone:s.timezone,assets:s.assets,date,title,kind:'policy',importance:'high',status:'scheduled',dateOnly:true,watch:'关注决议、政策措辞与后续指引；政策相对市场预期的变化可能影响利率、汇率和风险资产。',...extra};}
+export function parseCalendar(html,s){
+ const events=[];
+ if(s.parser==='fed'){
+  for(const y of html.matchAll(/(\d{4}) FOMC Meetings([\s\S]*?)(?=\d{4} FOMC Meetings|$)/g)){
+   for(const r of y[2].matchAll(/fomc-meeting__month[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*fomc-meeting__date[^>]*>([\s\S]*?)<\/div>/g)){
+    const months=calPlain(r[1]).split('/'),ds=calPlain(r[2]).match(/^(\d{1,2})-(\d{1,2})(\*)?$/);if(!ds)continue;
+    const startDate=calDate(y[1],calMonth(months[0]),ds[1]),date=calDate(y[1],calMonth(months.at(-1)),ds[2]);
+    events.push(calEvent(s,date,'美联储 FOMC 议息会议'+(ds[3]?' · 经济预测':''),{startDate,watch:ds[3]?'关注利率决议、经济预测和点阵图；比较政策路径与之前指引。':'关注利率决议、声明和发布会；观察通胀与就业风险表述的变化。',note:'会议日期按美国当地时间；本来源未提供具体决议时刻，后续日期可能调整。'}));
+   }
+  }
+ }else if(s.parser==='ecb'){
+  let firstDate;
+  for(const r of html.matchAll(/<dt[^>]*>([\s\S]*?)<\/dt>\s*<dd[^>]*>([\s\S]*?)<\/dd>/g)){
+   const d=calPlain(r[1]).match(/(\d{2})\/(\d{2})\/(\d{4})/),label=calPlain(r[2]);if(!d||!/monetary policy meeting/.test(label)||/non-monetary/.test(label))continue;
+   const date=calDate(d[3],d[2],d[1]);if(/Day 1/.test(label)){firstDate=date;continue;}
+   if(/Day 2/.test(label))events.push(calEvent(s,date,'欧洲央行利率决议与发布会',{startDate:firstDate,watch:'关注利率路径、通胀预测与增长评估；欧元和欧股可能对意外措辞更敏感。'}));
+  }
+ }else if(s.parser==='boe'||s.parser==='boj'){
+  for(const y of html.matchAll(/<h2[^>]*>\s*(\d{4})(?: confirmed dates)?\s*<\/h2>([\s\S]*?)(?=<h2|$)/gi)){
+   const table=y[2].match(/<table\b[\s\S]*?<\/table>/i)?.[0]||'';
+   for(const row of table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)){
+    const c=calCells(row[1]);if(!c.length)continue;
+    if(s.parser==='boe'){const d=c[0].match(/Thursday\s+(\d+)\s+(\w+)/i);if(d)events.push(calEvent(s,calDate(y[1],calMonth(d[2]),d[1]),'英国央行利率决议'+(/Monetary Policy Report/.test(c[1])?' · 货币政策报告':''),{watch:'关注投票分歧、工资和服务通胀判断，以及英镑与英国股市的反应。'}));}
+    else{const d=c[0].match(/^([A-Za-z]+)\.?\s+(\d+)\s*\([^)]*\),\s*(\d+)\s*\(/);if(d)events.push(calEvent(s,calDate(y[1],calMonth(d[1]),d[3]),'日本央行货币政策会议'+(c[1]!=='-'?' · 展望报告':''),{startDate:calDate(y[1],calMonth(d[1]),d[2]),watch:'关注政策利率、购债安排和物价判断；日元变化也会影响出口企业利润换算。',note:'日本当地会议日期；决议发布时间不固定。'}));}
+   }
+  }
+ }else if(s.parser==='ics'){
+  const specs=[[/^Employment Situation$/,'美国非农就业报告','关注新增就业、失业率、工资与前值修订；就业强弱可能改变利率预期。','high'],[/^Consumer Price Index$/,'美国 CPI 通胀','关注核心和整体 CPI 环比，以及住房与服务项；不能仅凭同比推断政策。','high'],[/^Producer Price Index$/,'美国 PPI','关注生产端价格压力及其向消费端传导的可能性。','medium'],[/^Job Openings and Labor Turnover/,'美国 JOLTS 职位空缺','关注职位空缺、离职率与就业需求变化。','medium'],[/^Personal Income and Outlays/,'美国个人收入与支出 · PCE','关注核心 PCE 环比、居民支出与收入；PCE 是美联储观察通胀的重要指标。','high'],[/^(?:Gross Domestic Product(?=,| \()|GDP \()/,'美国 GDP','区分初值与修订值，关注消费、投资和库存对增长的贡献。','high']];
+  const unfolded=html.replace(/\r?\n[ \t]/g,'');
+  for(const row of unfolded.matchAll(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/g)){
+   if(/^STATUS:CANCELLED\s*$/m.test(row[1]))continue;
+   const title=row[1].match(/^SUMMARY:(.*)$/m)?.[1]?.trim().replace(/\\,/g,',');const spec=specs.find(([re])=>re.test(title||''));if(!spec)continue;
+   const dt=row[1].match(/^DTSTART([^:\r\n]*):(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?/m);if(!dt)continue;
+   const date=calDate(dt[2],dt[3],dt[4]);const time=dt[5]?`${dt[5]}:${dt[6]}`:null;const tz=dt[1].match(/TZID=([^;]+)/)?.[1];const zone=tz==='US-Eastern'?'America/New_York':tz||s.timezone;
+   const startsAt=time?(dt[8]?`${date}T${time}:${dt[7]||'00'}Z`:zonedTimeToISO(date,time,zone)):undefined;
+   const displayTitle=spec[1]==='美国 GDP'?spec[1]+(/Advance Estimate|Initial Estimate/.test(title)?' · 初值':/Second Estimate/.test(title)?' · 第二次估算':/Third Estimate/.test(title)?' · 第三次估算':' · 修订'):spec[1];
+   events.push(calEvent(s,date,displayTitle,{originalTitle:title,kind:'data',importance:spec[3],watch:spec[2],startsAt,dateOnly:!startsAt,timezone:zone,note:'时间来自官方订阅日历，已自动处理夏令时；日程可能修订。'}));
+  }
+ }else if(s.parser==='nbs'){
+  const year=html.match(/(\d{4})年国家统计局主要统计信息发布日程表/)?.[1];if(!year)return [];
+  const specs=[['国民经济运行情况','中国国民经济运行数据','关注增长、工业、消费和投资；季度月份同时关注 GDP。'],['采购经理指数月度报告','中国官方 PMI','关注制造业、非制造业与新订单；50 是扩张和收缩的分界。'],['居民消费价格指数月度报告','中国 CPI','关注消费价格及核心通胀，结合需求与货币政策判断。'],['工业生产者价格指数月度报告','中国 PPI','关注工业品价格与企业利润压力。']];
+  const rows=[...html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)];
+  for(let ri=0;ri<rows.length;ri++){
+   const c=calCells(rows[ri][1]);const spec=specs.find(x=>c[1]===x[0]);if(!spec||c.length!==14)continue;
+   const timeCells=calCells(rows[ri+1]?.[1]||'');let ti=0;
+   c.slice(2).forEach((cell,i)=>{const days=[...cell.matchAll(/(\d{1,2})\s*\/\s*[一二三四五六日天]/g)];if(!days.length)return;const time=timeCells[ti++]?.match(/^(\d{1,2}):([0-5]\d)$/);for(const d of days){const date=calDate(year,i+1,d[1]);events.push(calEvent(s,date,spec[1],{kind:'data',watch:spec[2],...(time?{startsAt:zonedTimeToISO(date,`${time[1]}:${time[2]}`,s.timezone),dateOnly:false}:{}),note:'国家统计局初步计划；以官方临近发布安排为准。'}));}});
+  }
+ }
+ return events;
+}
+export async function collectCalendar(previous={},now=Date.now(),fetchText=async url=>{const r=await fetch(url,{signal:AbortSignal.timeout(18000)});if(!r.ok)throw new Error('HTTP '+r.status);return r.text()}){
+ const checkedAt=new Date(now).toISOString(),minDate=new Date(now-35*CAL_DAY).toISOString().slice(0,10),maxDate=new Date(now+550*CAL_DAY).toISOString().slice(0,10);
+ const result=await Promise.all(CALENDAR_SOURCES.map(async s=>{
+  try{
+   let html=await fetchText(s.url),url=s.url,events;
+   if(s.parser==='nbs'){
+    const links=[...html.matchAll(/href=["']([^"']+)["'][^>]*>(\d{4})年国家统计局主要统计信息发布日程表/g)].filter(m=>Number(m[2])>=new Date(now).getUTCFullYear());
+    if(!links.length)throw new Error('未发现当年官方发布日程');events=[];
+    for(const link of links.slice(0,2)){url=new URL(link[1],s.url).href;const detail=await fetchText(url);events.push(...parseCalendar(detail,{...s,url}));}
+   }else events=parseCalendar(html,s);
+   if(!events.length)throw new Error('官方日程格式变化或未解析到事件');
+   events=events.filter(e=>e.date>=minDate&&e.date<=maxDate).map(e=>({...e,verifiedAt:checkedAt,stale:false}));
+   if(!events.some(e=>e.date>=new Date(now).toISOString().slice(0,10)))throw new Error('官方来源暂未提供后续日程');
+   return {events,status:{id:s.id,name:s.name,url:s.url,ok:true,count:events.length,checkedAt,error:null}};
+  }catch(e){return {events:(previous.events||[]).filter(e=>e.sourceId===s.id&&e.date>=minDate&&e.date<=maxDate).map(e=>({...e,stale:true})),status:{id:s.id,name:s.name,url:s.url,ok:false,count:0,checkedAt,error:String(e.message).slice(0,150)}};}
+ }));
+ const events=[...new Map(result.flatMap(r=>r.events).map(e=>[e.id,e])).values()].sort((a,b)=>(a.startsAt||a.date).localeCompare(b.startsAt||b.date));
+ return {events,calendarSources:result.map(r=>r.status),calendarCheckedAt:checkedAt};
+}
+
 const DAY=86400000;
 const TRUSTED_DOMAINS=['reuters.com','bloomberg.com','ft.com','ftchinese.com','wsj.com','cnbc.com','sina.com.cn','sina.cn','eastmoney.com','cls.cn','stcn.com','cnstock.com','yicai.com','21jingji.com','thepaper.cn','jiemian.com','stheadline.com','hk01.com','hket.com','aastocks.com','yahoo.com','investing.com','caixin.com','xinhua.com','news.cn','chinanews.com.cn','chinanews.com','cnr.cn','gov.cn','cctv.com','people.com.cn','chinadaily.com.cn','stnn.cc','dw.com','bbc.com','rfi.fr','rthk.hk','coindesk.com','cointelegraph.com','theblock.co','decrypt.co','zaobao.com.sg','zaobao.com','fxstreet.com','wallstreetcn.com','36kr.com','nbd.com.cn','mrjjxw.com','stockstar.com','10jqka.com.cn','hexun.com','financialnews.com.cn','hkej.com','etnet.com.hk','businesstimes.com.sg','scmp.com','nikkei.com','moneydj.com','cnyes.com','udn.com','reutersconnect.com','pbc.gov.cn','rbi.org.in','hkma.gov.hk','ecb.europa.eu','federalreserve.gov'];
 export function trustedPublisher(url){try{const host=new URL(url).hostname.toLowerCase();return TRUSTED_DOMAINS.some(d=>host===d||host.endsWith('.'+d))}catch{return false}}
@@ -73,6 +164,7 @@ export async function collectSource(s,now=Date.now()){
 }
 export async function collect(previous={},now=Date.now()){
  const stamp=new Date(now).toISOString();
+ const calendarPromise=collectCalendar(previous,now);
  const newsResults=await pool(SOURCES,async s=>{try{const items=await collectSource(s,now);return {items,status:{id:s.id,name:s.name,url:s.home,ok:true,count:items.length,checkedAt:stamp,error:null}};}catch(e){return {items:[],status:{id:s.id,name:s.name,url:s.home,ok:false,count:0,checkedAt:stamp,error:String(e.message).slice(0,160)}};}});
  const markets=await pool(ASSETS,async a=>{try{return await collectMarket(a,now);}catch(e){const old=previous.markets?.find(m=>m.id===a.id);return {...a,...old,points:old?.points||[],ok:false,error:String(e.message).slice(0,160)};}});
  let fxReference=previous.fxReference||null;let fxStatus;
@@ -83,6 +175,7 @@ export async function collect(previous={},now=Date.now()){
  const date=beijingDate(now),today=news.filter(n=>Date.parse(n.publishedAt)>=now-DAY);
  const selected=[];const counts=new Map();for(const c of ['macro','market','earnings','company','gold','crypto']){const candidates=today.filter(n=>n.category===c);for(const n of candidates){if((counts.get(n.source)||0)>=2)continue;selected.push(n.id);counts.set(n.source,(counts.get(n.source)||0)+1);if(selected.filter(id=>news.find(x=>x.id===id)?.category===c).length>=2)break;}}
  const edition={date,generatedAt:stamp,newsCount:today.length,headlineIds:selected,coverage:newsResults.filter(r=>r.status.ok).length,totalSources:newsResults.length,markets:markets.map(({points,...m})=>m)};
- return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,fxReference,sources,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
+ return {schemaVersion:1,generatedAt:stamp,producer:process.env.GITHUB_ACTIONS?'github-actions':'local',news,markets,fxReference,sources,...await calendarPromise,editions:[edition,...(previous.editions||[]).filter(e=>e.date!==date)].slice(0,120)};
 }
+
 
